@@ -7,6 +7,11 @@ import json
 from typing_extensions import Literal
 from utils.progress import progress
 from utils.llm import call_llm
+from tools.binance_data import binance
+from tools.api import get_company_news
+import logging
+
+logger = logging.getLogger(__name__)
 
 class CharlieMungerSignal(BaseModel):
     signal: Literal["bullish", "bearish", "neutral"]
@@ -15,143 +20,78 @@ class CharlieMungerSignal(BaseModel):
 
 
 def charlie_munger_agent(state: AgentState):
-    """
-    Analyzes stocks using Charlie Munger's investing principles and mental models.
-    Focuses on moat strength, management quality, predictability, and valuation.
-    """
+    """Charlie Munger 分析代理 - 加密货币版本"""
     data = state["data"]
-    end_date = data["end_date"]
     tickers = data["tickers"]
-    
-    analysis_data = {}
-    munger_analysis = {}
+    analysis_results = {}
     
     for ticker in tickers:
-        progress.update_status("charlie_munger_agent", ticker, "Fetching financial metrics")
-        metrics = get_financial_metrics(ticker, end_date, period="annual", limit=10)  # Munger looks at longer periods
-        
-        progress.update_status("charlie_munger_agent", ticker, "Gathering financial line items")
-        financial_line_items = search_line_items(
-            ticker,
-            [
-                "revenue",
-                "net_income",
-                "operating_income",
-                "return_on_invested_capital",
-                "gross_margin",
-                "operating_margin",
-                "free_cash_flow",
-                "capital_expenditure",
-                "cash_and_equivalents",
-                "total_debt",
-                "shareholders_equity",
-                "outstanding_shares",
-                "research_and_development",
-                "goodwill_and_intangible_assets",
-            ],
-            end_date,
-            period="annual",
-            limit=10  # Munger examines long-term trends
-        )
-        
-        progress.update_status("charlie_munger_agent", ticker, "Getting market cap")
-        market_cap = get_market_cap(ticker, end_date)
-        
-        progress.update_status("charlie_munger_agent", ticker, "Fetching insider trades")
-        # Munger values management with skin in the game
-        insider_trades = get_insider_trades(
-            ticker,
-            end_date,
-            # Look back 2 years for insider trading patterns
-            start_date=None,
-            limit=100
-        )
-        
-        progress.update_status("charlie_munger_agent", ticker, "Fetching company news")
-        # Munger avoids businesses with frequent negative press
-        company_news = get_company_news(
-            ticker,
-            end_date,
-            # Look back 1 year for news
-            start_date=None,
-            limit=100
-        )
-        
-        progress.update_status("charlie_munger_agent", ticker, "Analyzing moat strength")
-        moat_analysis = analyze_moat_strength(metrics, financial_line_items)
-        
-        progress.update_status("charlie_munger_agent", ticker, "Analyzing management quality")
-        management_analysis = analyze_management_quality(financial_line_items, insider_trades)
-        
-        progress.update_status("charlie_munger_agent", ticker, "Analyzing business predictability")
-        predictability_analysis = analyze_predictability(financial_line_items)
-        
-        progress.update_status("charlie_munger_agent", ticker, "Calculating Munger-style valuation")
-        valuation_analysis = calculate_munger_valuation(financial_line_items, market_cap)
-        
-        # Combine partial scores with Munger's weighting preferences
-        # Munger weights quality and predictability higher than current valuation
-        total_score = (
-            moat_analysis["score"] * 0.35 +
-            management_analysis["score"] * 0.25 +
-            predictability_analysis["score"] * 0.25 +
-            valuation_analysis["score"] * 0.15
-        )
-        
-        max_possible_score = 10  # Scale to 0-10
-        
-        # Generate a simple buy/hold/sell signal
-        if total_score >= 7.5:  # Munger has very high standards
-            signal = "bullish"
-        elif total_score <= 4.5:
-            signal = "bearish"
-        else:
+        try:
+            # 获取市场数据
+            ticker_24h = binance.get_ticker_24h(ticker)
+            klines = binance.get_klines(ticker, interval='1d', limit=90)  # 3个月数据
+            
+            # 分析数据
+            current_price = float(ticker_24h['lastPrice'])
+            volume = float(ticker_24h['volume'])
+            
+            # 计算长期趋势
+            closing_prices = [float(k[4]) for k in klines]
+            price_trend_90d = (closing_prices[-1] - closing_prices[0]) / closing_prices[0] * 100
+            
+            # Munger 风格分析（长期价值投资）
             signal = "neutral"
-        
-        analysis_data[ticker] = {
-            "signal": signal,
-            "score": total_score,
-            "max_score": max_possible_score,
-            "moat_analysis": moat_analysis,
-            "management_analysis": management_analysis,
-            "predictability_analysis": predictability_analysis,
-            "valuation_analysis": valuation_analysis,
-            # Include some qualitative assessment from news
-            "news_sentiment": analyze_news_sentiment(company_news) if company_news else "No news data available"
-        }
-        
-        progress.update_status("charlie_munger_agent", ticker, "Generating Charlie Munger analysis")
-        munger_output = generate_munger_output(
-            ticker=ticker, 
-            analysis_data=analysis_data,
-            model_name=state["metadata"]["model_name"],
-            model_provider=state["metadata"]["model_provider"],
-        )
-        
-        munger_analysis[ticker] = {
-            "signal": munger_output.signal,
-            "confidence": munger_output.confidence,
-            "reasoning": munger_output.reasoning
-        }
-        
-        progress.update_status("charlie_munger_agent", ticker, "Done")
+            confidence = 50.0
+            reasons = []
+            
+            # 分析长期趋势
+            if price_trend_90d > 50:
+                signal = "bullish"
+                confidence += 20
+                reasons.append(f"强劲的长期上涨趋势 ({price_trend_90d:.2f}%)")
+            elif price_trend_90d < -50:
+                signal = "bearish"
+                confidence += 20
+                reasons.append(f"显著的长期下跌趋势 ({price_trend_90d:.2f}%)")
+            
+            # 分析交易量稳定性
+            volumes = [float(k[5]) for k in klines]
+            avg_volume = sum(volumes) / len(volumes)
+            vol_stability = all(0.5 <= v/avg_volume <= 2.0 for v in volumes[-30:])
+            
+            if vol_stability:
+                confidence += 15
+                reasons.append("交易量保持稳定")
+            
+            analysis_results[ticker] = {
+                "signal": signal,
+                "confidence": min(confidence, 100),
+                "reasoning": " | ".join(reasons),
+                "metrics": {
+                    "current_price": current_price,
+                    "volume_24h": volume,
+                    "price_trend_90d": price_trend_90d,
+                    "volume_stability": vol_stability
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"分析{ticker}时出错: {e}")
+            analysis_results[ticker] = {
+                "signal": "neutral",
+                "confidence": 0,
+                "reasoning": f"分析出错: {str(e)}",
+                "metrics": {}
+            }
     
-    # Wrap results in a single message for the chain
-    message = HumanMessage(
-        content=json.dumps(munger_analysis),
-        name="charlie_munger_agent"
-    )
-    
-    # Show reasoning if requested
-    if state["metadata"]["show_reasoning"]:
-        show_agent_reasoning(munger_analysis, "Charlie Munger Agent")
-    
-    # Add signals to the overall state
-    state["data"]["analyst_signals"]["charlie_munger_agent"] = munger_analysis
-
     return {
-        "messages": [message],
-        "data": state["data"]
+        "data": {
+            **state["data"],
+            "analyst_signals": {
+                **state["data"].get("analyst_signals", {}),
+                "charlie_munger_agent": analysis_results
+            }
+        }
     }
 
 

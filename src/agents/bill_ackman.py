@@ -8,6 +8,11 @@ import json
 from typing_extensions import Literal
 from utils.progress import progress
 from utils.llm import call_llm
+from tools.binance_data import binance
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 class BillAckmanSignal(BaseModel):
     signal: Literal["bullish", "bearish", "neutral"]
@@ -16,105 +21,114 @@ class BillAckmanSignal(BaseModel):
 
 
 def bill_ackman_agent(state: AgentState):
-    """
-    Analyzes stocks using Bill Ackman's investing principles and LLM reasoning.
-    Fetches multiple periods of data so we can analyze long-term trends.
-    """
+    """Bill Ackman 分析代理 - 加密货币版本"""
     data = state["data"]
-    end_date = data["end_date"]
     tickers = data["tickers"]
-    
-    analysis_data = {}
-    ackman_analysis = {}
+    analysis_results = {}
     
     for ticker in tickers:
-        progress.update_status("bill_ackman_agent", ticker, "Fetching financial metrics")
-        metrics = get_financial_metrics(ticker, end_date, period="annual", limit=5)
-        
-        progress.update_status("bill_ackman_agent", ticker, "Gathering financial line items")
-        # Request multiple periods of data (annual or TTM) for a more robust long-term view.
-        financial_line_items = search_line_items(
-            ticker,
-            [
-                "revenue",
-                "operating_margin",
-                "debt_to_equity",
-                "free_cash_flow",
-                "total_assets",
-                "total_liabilities",
-                "dividends_and_other_cash_distributions",
-                "outstanding_shares"
-            ],
-            end_date,
-            period="annual",  # or "ttm" if you prefer trailing 12 months
-            limit=5           # fetch up to 5 annual periods (or more if needed)
-        )
-        
-        progress.update_status("bill_ackman_agent", ticker, "Getting market cap")
-        market_cap = get_market_cap(ticker, end_date)
-        
-        progress.update_status("bill_ackman_agent", ticker, "Analyzing business quality")
-        quality_analysis = analyze_business_quality(metrics, financial_line_items)
-        
-        progress.update_status("bill_ackman_agent", ticker, "Analyzing balance sheet and capital structure")
-        balance_sheet_analysis = analyze_financial_discipline(metrics, financial_line_items)
-        
-        progress.update_status("bill_ackman_agent", ticker, "Calculating intrinsic value & margin of safety")
-        valuation_analysis = analyze_valuation(financial_line_items, market_cap)
-        
-        # Combine partial scores or signals
-        total_score = quality_analysis["score"] + balance_sheet_analysis["score"] + valuation_analysis["score"]
-        max_possible_score = 15  # Adjust weighting as desired
-        
-        # Generate a simple buy/hold/sell (bullish/neutral/bearish) signal
-        if total_score >= 0.7 * max_possible_score:
-            signal = "bullish"
-        elif total_score <= 0.3 * max_possible_score:
-            signal = "bearish"
-        else:
+        try:
+            # 获取市场数据
+            ticker_24h = binance.get_ticker_24h(ticker)
+            klines = binance.get_klines(ticker, interval='1d', limit=30)  # 30天数据
+            klines_4h = binance.get_klines(ticker, interval='4h', limit=30)  # 4小时数据，用于短期分析
+            
+            # 分析数据
+            current_price = float(ticker_24h['lastPrice'])
+            volume = float(ticker_24h['volume'])
+            price_change = float(ticker_24h['priceChangePercent'])
+            weighted_avg_price = float(ticker_24h['weightedAvgPrice'])
+            
+            # 计算趋势
+            closing_prices = [float(k[4]) for k in klines]
+            price_trend = (closing_prices[-1] - closing_prices[0]) / closing_prices[0] * 100
+            
+            # 计算短期趋势（4小时）
+            short_term_prices = [float(k[4]) for k in klines_4h]
+            short_term_trend = (short_term_prices[-1] - short_term_prices[0]) / short_term_prices[0] * 100
+            
+            # 计算波动性
+            daily_changes = [(float(k[4]) - float(k[1])) / float(k[1]) * 100 for k in klines]
+            volatility = sum(abs(x) for x in daily_changes) / len(daily_changes)
+            
+            # Ackman 风格分析（激进投资）
             signal = "neutral"
-        
-        analysis_data[ticker] = {
-            "signal": signal,
-            "score": total_score,
-            "max_score": max_possible_score,
-            "quality_analysis": quality_analysis,
-            "balance_sheet_analysis": balance_sheet_analysis,
-            "valuation_analysis": valuation_analysis
-        }
-        
-        progress.update_status("bill_ackman_agent", ticker, "Generating Bill Ackman analysis")
-        ackman_output = generate_ackman_output(
-            ticker=ticker, 
-            analysis_data=analysis_data,
-            model_name=state["metadata"]["model_name"],
-            model_provider=state["metadata"]["model_provider"],
-        )
-        
-        ackman_analysis[ticker] = {
-            "signal": ackman_output.signal,
-            "confidence": ackman_output.confidence,
-            "reasoning": ackman_output.reasoning
-        }
-        
-        progress.update_status("bill_ackman_agent", ticker, "Done")
+            confidence = 50.0
+            reasons = []
+            
+            # 1. 趋势分析（权重：40%）
+            if price_trend > 20 and short_term_trend > 5:
+                signal = "bullish"
+                confidence += 20
+                reasons.append(f"强劲上涨趋势（月度：{price_trend:.2f}%，短期：{short_term_trend:.2f}%）")
+            elif price_trend < -20 and short_term_trend < -5:
+                signal = "bearish"
+                confidence += 20
+                reasons.append(f"显著下跌趋势（月度：{price_trend:.2f}%，短期：{short_term_trend:.2f}%）")
+            
+            # 2. 价格动量（权重：20%）
+            if price_change > 5 and volume > float(ticker_24h['volume']) * 1.2:
+                if signal == "bullish":
+                    confidence += 10
+                    reasons.append(f"强劲买入动能（24h变化：{price_change:.2f}%，成交量增加）")
+                else:
+                    signal = "bullish"
+                    confidence += 5
+                    reasons.append(f"潜在反转信号（24h变化：{price_change:.2f}%）")
+            elif price_change < -5 and volume > float(ticker_24h['volume']) * 1.2:
+                if signal == "bearish":
+                    confidence += 10
+                    reasons.append(f"强劲卖出动能（24h变化：{price_change:.2f}%，成交量增加）")
+                else:
+                    signal = "bearish"
+                    confidence += 5
+                    reasons.append(f"潜在反转信号（24h变化：{price_change:.2f}%）")
+            
+            # 3. 波动性分析（权重：20%）
+            if volatility > 5:  # 高波动性
+                confidence = max(30, confidence - 10)  # 降低信心度
+                reasons.append(f"高波动性环境（日均波动：{volatility:.2f}%）需要谨慎")
+            else:  # 低波动性
+                confidence += 10
+                reasons.append(f"市场波动性较低（{volatility:.2f}%），信号更可靠")
+            
+            # 4. 价格相对于加权平均价（权重：20%）
+            price_to_wavg = (current_price - weighted_avg_price) / weighted_avg_price * 100
+            if abs(price_to_wavg) > 3:
+                if price_to_wavg > 0 and signal == "bullish":
+                    confidence += 10
+                    reasons.append(f"价格高于加权平均价 {price_to_wavg:.2f}%，确认上涨趋势")
+                elif price_to_wavg < 0 and signal == "bearish":
+                    confidence += 10
+                    reasons.append(f"价格低于加权平均价 {abs(price_to_wavg):.2f}%，确认下跌趋势")
+            
+            # 确保信心度不超过100
+            confidence = min(confidence, 100)
+            
+            # 如果没有明确信号，保持中性
+            if confidence < 40:
+                signal = "neutral"
+                reasons.append("信号强度不足，保持中性观望")
+            
+            analysis_results[ticker] = BillAckmanSignal(
+                signal=signal,
+                confidence=confidence,
+                reasoning=" | ".join(reasons)
+            ).dict()
+            
+        except Exception as e:
+            logger.error(f"分析{ticker}时出错: {str(e)}")
+            analysis_results[ticker] = BillAckmanSignal(
+                signal="neutral",
+                confidence=0,
+                reasoning=f"分析出错: {str(e)}"
+            ).dict()
     
-    # Wrap results in a single message for the chain
-    message = HumanMessage(
-        content=json.dumps(ackman_analysis),
-        name="bill_ackman_agent"
-    )
-    
-    # Show reasoning if requested
-    if state["metadata"]["show_reasoning"]:
-        show_agent_reasoning(ackman_analysis, "Bill Ackman Agent")
-    
-    # Add signals to the overall state
-    state["data"]["analyst_signals"]["bill_ackman_agent"] = ackman_analysis
-
     return {
-        "messages": [message],
-        "data": state["data"]
+        "data": {
+            **state["data"],
+            "bill_ackman": analysis_results  # 移除_agent后缀
+        }
     }
 
 

@@ -2,139 +2,84 @@ from langchain_core.messages import HumanMessage
 from graph.state import AgentState, show_agent_reasoning
 from utils.progress import progress
 import json
+from tools.binance_data import binance
+import logging
 
-from tools.api import get_financial_metrics, get_market_cap, search_line_items
+logger = logging.getLogger(__name__)
 
 
 ##### Valuation Agent #####
 def valuation_agent(state: AgentState):
-    """Performs detailed valuation analysis using multiple methodologies for multiple tickers."""
+    """估值分析代理 - 加密货币版本"""
     data = state["data"]
-    end_date = data["end_date"]
     tickers = data["tickers"]
-
-    # Initialize valuation analysis for each ticker
-    valuation_analysis = {}
-
+    analysis_results = {}
+    
     for ticker in tickers:
-        progress.update_status("valuation_agent", ticker, "Fetching financial data")
-
-        # Fetch the financial metrics
-        financial_metrics = get_financial_metrics(
-            ticker=ticker,
-            end_date=end_date,
-            period="ttm",
-        )
-
-        # Add safety check for financial metrics
-        if not financial_metrics:
-            progress.update_status("valuation_agent", ticker, "Failed: No financial metrics found")
-            continue
-        
-        metrics = financial_metrics[0]
-
-        progress.update_status("valuation_agent", ticker, "Gathering line items")
-        # Fetch the specific line_items that we need for valuation purposes
-        financial_line_items = search_line_items(
-            ticker=ticker,
-            line_items=[
-                "free_cash_flow",
-                "net_income",
-                "depreciation_and_amortization",
-                "capital_expenditure",
-                "working_capital",
-            ],
-            end_date=end_date,
-            period="ttm",
-            limit=2,
-        )
-
-        # Add safety check for financial line items
-        if len(financial_line_items) < 2:
-            progress.update_status("valuation_agent", ticker, "Failed: Insufficient financial line items")
-            continue
-
-        # Pull the current and previous financial line items
-        current_financial_line_item = financial_line_items[0]
-        previous_financial_line_item = financial_line_items[1]
-
-        progress.update_status("valuation_agent", ticker, "Calculating owner earnings")
-        # Calculate working capital change
-        working_capital_change = current_financial_line_item.working_capital - previous_financial_line_item.working_capital
-
-        # Owner Earnings Valuation (Buffett Method)
-        owner_earnings_value = calculate_owner_earnings_value(
-            net_income=current_financial_line_item.net_income,
-            depreciation=current_financial_line_item.depreciation_and_amortization,
-            capex=current_financial_line_item.capital_expenditure,
-            working_capital_change=working_capital_change,
-            growth_rate=metrics.earnings_growth,
-            required_return=0.15,
-            margin_of_safety=0.25,
-        )
-
-        progress.update_status("valuation_agent", ticker, "Calculating DCF value")
-        # DCF Valuation
-        dcf_value = calculate_intrinsic_value(
-            free_cash_flow=current_financial_line_item.free_cash_flow,
-            growth_rate=metrics.earnings_growth,
-            discount_rate=0.10,
-            terminal_growth_rate=0.03,
-            num_years=5,
-        )
-
-        progress.update_status("valuation_agent", ticker, "Comparing to market value")
-        # Get the market cap
-        market_cap = get_market_cap(ticker=ticker, end_date=end_date)
-
-        # Calculate combined valuation gap (average of both methods)
-        dcf_gap = (dcf_value - market_cap) / market_cap
-        owner_earnings_gap = (owner_earnings_value - market_cap) / market_cap
-        valuation_gap = (dcf_gap + owner_earnings_gap) / 2
-
-        if valuation_gap > 0.15:  # More than 15% undervalued
-            signal = "bullish"
-        elif valuation_gap < -0.15:  # More than 15% overvalued
-            signal = "bearish"
-        else:
+        try:
+            # 获取市场数据
+            ticker_24h = binance.get_ticker_24h(ticker)
+            klines = binance.get_klines(ticker, interval='1d', limit=30)
+            
+            # 分析数据
+            current_price = float(ticker_24h['lastPrice'])
+            volume = float(ticker_24h['volume'])
+            
+            # 计算估值指标
+            avg_price_30d = sum(float(k[4]) for k in klines) / len(klines)
+            avg_volume_30d = sum(float(k[5]) for k in klines) / len(klines)
+            
+            # 估值分析
             signal = "neutral"
-
-        # Create the reasoning
-        reasoning = {}
-        reasoning["dcf_analysis"] = {
-            "signal": ("bullish" if dcf_gap > 0.15 else "bearish" if dcf_gap < -0.15 else "neutral"),
-            "details": f"Intrinsic Value: ${dcf_value:,.2f}, Market Cap: ${market_cap:,.2f}, Gap: {dcf_gap:.1%}",
-        }
-
-        reasoning["owner_earnings_analysis"] = {
-            "signal": ("bullish" if owner_earnings_gap > 0.15 else "bearish" if owner_earnings_gap < -0.15 else "neutral"),
-            "details": f"Owner Earnings Value: ${owner_earnings_value:,.2f}, Market Cap: ${market_cap:,.2f}, Gap: {owner_earnings_gap:.1%}",
-        }
-
-        confidence = round(abs(valuation_gap), 2) * 100
-        valuation_analysis[ticker] = {
-            "signal": signal,
-            "confidence": confidence,
-            "reasoning": reasoning,
-        }
-
-        progress.update_status("valuation_agent", ticker, "Done")
-
-    message = HumanMessage(
-        content=json.dumps(valuation_analysis),
-        name="valuation_agent",
-    )
-
-    # Print the reasoning if the flag is set
-    if state["metadata"]["show_reasoning"]:
-        show_agent_reasoning(valuation_analysis, "Valuation Analysis Agent")
-
-    # Add the signal to the analyst_signals list
-    state["data"]["analyst_signals"]["valuation_agent"] = valuation_analysis
-
+            confidence = 50.0
+            reasons = []
+            
+            # 价格相对于30天均价的偏离
+            price_deviation = (current_price - avg_price_30d) / avg_price_30d * 100
+            if price_deviation < -20:
+                signal = "bullish"
+                confidence += 20
+                reasons.append(f"价格显著低于30天均价 ({price_deviation:.2f}%)")
+            elif price_deviation > 20:
+                signal = "bearish"
+                confidence += 20
+                reasons.append(f"价格显著高于30天均价 ({price_deviation:.2f}%)")
+            
+            # 交易量分析
+            volume_ratio = volume / avg_volume_30d
+            if volume_ratio > 2:
+                confidence += 15
+                reasons.append(f"交易量显著高于平均水平 ({volume_ratio:.2f}x)")
+            
+            analysis_results[ticker] = {
+                "signal": signal,
+                "confidence": min(confidence, 100),
+                "reasoning": " | ".join(reasons),
+                "metrics": {
+                    "current_price": current_price,
+                    "avg_price_30d": avg_price_30d,
+                    "price_deviation": price_deviation,
+                    "volume_ratio": volume_ratio
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"分析{ticker}时出错: {e}")
+            analysis_results[ticker] = {
+                "signal": "neutral",
+                "confidence": 0,
+                "reasoning": f"分析出错: {str(e)}",
+                "metrics": {}
+            }
+    
     return {
-        "messages": [message],
-        "data": data,
+        "data": {
+            **state["data"],
+            "analyst_signals": {
+                **state["data"].get("analyst_signals", {}),
+                "valuation_agent": analysis_results
+            }
+        }
     }
 
 

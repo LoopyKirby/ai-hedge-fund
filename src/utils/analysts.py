@@ -14,57 +14,57 @@ from agents.warren_buffett import warren_buffett_agent
 
 # Define analyst configuration - single source of truth
 ANALYST_CONFIG = {
-    "ben_graham": {
+    "ben_graham_agent": {
         "display_name": "Ben Graham",
         "agent_func": ben_graham_agent,
         "order": 0,
     },
-    "bill_ackman": {
+    "bill_ackman_agent": {
         "display_name": "Bill Ackman",
         "agent_func": bill_ackman_agent,
         "order": 1,
     },
-    "cathie_wood": {
+    "cathie_wood_agent": {
         "display_name": "Cathie Wood",
         "agent_func": cathie_wood_agent,
         "order": 2,
     },
-    "charlie_munger": {
+    "charlie_munger_agent": {
         "display_name": "Charlie Munger",
         "agent_func": charlie_munger_agent,
         "order": 3,
     },
-    "phil_fisher": {
+    "phil_fisher_agent": {
         "display_name": "Phil Fisher",
         "agent_func": phil_fisher_agent,
         "order": 4,
     },
-    "stanley_druckenmiller": {
+    "stanley_druckenmiller_agent": {
         "display_name": "Stanley Druckenmiller",
         "agent_func": stanley_druckenmiller_agent,
         "order": 5,
     },
-    "warren_buffett": {
+    "warren_buffett_agent": {
         "display_name": "Warren Buffett",
         "agent_func": warren_buffett_agent,
         "order": 6,
     },
-    "technical_analyst": {
+    "technical_analyst_agent": {
         "display_name": "Technical Analyst",
         "agent_func": technical_analyst_agent,
         "order": 7,
     },
-    "fundamentals_analyst": {
+    "fundamentals_analyst_agent": {
         "display_name": "Fundamentals Analyst",
         "agent_func": fundamentals_agent,
         "order": 8,
     },
-    "sentiment_analyst": {
+    "sentiment_analyst_agent": {
         "display_name": "Sentiment Analyst",
         "agent_func": sentiment_agent,
         "order": 9,
     },
-    "valuation_analyst": {
+    "valuation_analyst_agent": {
         "display_name": "Valuation Analyst",
         "agent_func": valuation_agent,
         "order": 10,
@@ -77,4 +77,4 @@ ANALYST_ORDER = [(config["display_name"], key) for key, config in sorted(ANALYST
 
 def get_analyst_nodes():
     """Get the mapping of analyst keys to their (node_name, agent_func) tuples."""
-    return {key: (f"{key}_agent", config["agent_func"]) for key, config in ANALYST_CONFIG.items()}
+    return {key: (key, config["agent_func"]) for key, config in ANALYST_CONFIG.items()}

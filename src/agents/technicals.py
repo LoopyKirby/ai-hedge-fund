@@ -7,132 +7,139 @@ from graph.state import AgentState, show_agent_reasoning
 import json
 import pandas as pd
 import numpy as np
+import logging
+from typing import List
 
 from tools.api import get_prices, prices_to_df
 from utils.progress import progress
+from tools.binance_data import binance
+from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 
 ##### Technical Analyst #####
 def technical_analyst_agent(state: AgentState):
-    """
-    Sophisticated technical analysis system that combines multiple trading strategies for multiple tickers:
-    1. Trend Following
-    2. Mean Reversion
-    3. Momentum
-    4. Volatility Analysis
-    5. Statistical Arbitrage Signals
-    """
+    """技术分析代理"""
     data = state["data"]
-    start_date = data["start_date"]
-    end_date = data["end_date"]
     tickers = data["tickers"]
-
-    # Initialize analysis for each ticker
-    technical_analysis = {}
-
+    analysis_results = {}
+    
     for ticker in tickers:
-        progress.update_status("technical_analyst_agent", ticker, "Analyzing price data")
-
-        # Get the historical price data
-        prices = get_prices(
-            ticker=ticker,
-            start_date=start_date,
-            end_date=end_date,
-        )
-
-        if not prices:
-            progress.update_status("technical_analyst_agent", ticker, "Failed: No price data found")
-            continue
-
-        # Convert prices to a DataFrame
-        prices_df = prices_to_df(prices)
-
-        progress.update_status("technical_analyst_agent", ticker, "Calculating trend signals")
-        trend_signals = calculate_trend_signals(prices_df)
-
-        progress.update_status("technical_analyst_agent", ticker, "Calculating mean reversion")
-        mean_reversion_signals = calculate_mean_reversion_signals(prices_df)
-
-        progress.update_status("technical_analyst_agent", ticker, "Calculating momentum")
-        momentum_signals = calculate_momentum_signals(prices_df)
-
-        progress.update_status("technical_analyst_agent", ticker, "Analyzing volatility")
-        volatility_signals = calculate_volatility_signals(prices_df)
-
-        progress.update_status("technical_analyst_agent", ticker, "Statistical analysis")
-        stat_arb_signals = calculate_stat_arb_signals(prices_df)
-
-        # Combine all signals using a weighted ensemble approach
-        strategy_weights = {
-            "trend": 0.25,
-            "mean_reversion": 0.20,
-            "momentum": 0.25,
-            "volatility": 0.15,
-            "stat_arb": 0.15,
-        }
-
-        progress.update_status("technical_analyst_agent", ticker, "Combining signals")
-        combined_signal = weighted_signal_combination(
-            {
-                "trend": trend_signals,
-                "mean_reversion": mean_reversion_signals,
-                "momentum": momentum_signals,
-                "volatility": volatility_signals,
-                "stat_arb": stat_arb_signals,
-            },
-            strategy_weights,
-        )
-
-        # Generate detailed analysis report for this ticker
-        technical_analysis[ticker] = {
-            "signal": combined_signal["signal"],
-            "confidence": round(combined_signal["confidence"] * 100),
-            "strategy_signals": {
-                "trend_following": {
-                    "signal": trend_signals["signal"],
-                    "confidence": round(trend_signals["confidence"] * 100),
-                    "metrics": normalize_pandas(trend_signals["metrics"]),
-                },
-                "mean_reversion": {
-                    "signal": mean_reversion_signals["signal"],
-                    "confidence": round(mean_reversion_signals["confidence"] * 100),
-                    "metrics": normalize_pandas(mean_reversion_signals["metrics"]),
-                },
-                "momentum": {
-                    "signal": momentum_signals["signal"],
-                    "confidence": round(momentum_signals["confidence"] * 100),
-                    "metrics": normalize_pandas(momentum_signals["metrics"]),
-                },
-                "volatility": {
-                    "signal": volatility_signals["signal"],
-                    "confidence": round(volatility_signals["confidence"] * 100),
-                    "metrics": normalize_pandas(volatility_signals["metrics"]),
-                },
-                "statistical_arbitrage": {
-                    "signal": stat_arb_signals["signal"],
-                    "confidence": round(stat_arb_signals["confidence"] * 100),
-                    "metrics": normalize_pandas(stat_arb_signals["metrics"]),
-                },
-            },
-        }
-        progress.update_status("technical_analyst_agent", ticker, "Done")
-
-    # Create the technical analyst message
-    message = HumanMessage(
-        content=json.dumps(technical_analysis),
-        name="technical_analyst_agent",
-    )
-
-    if state["metadata"]["show_reasoning"]:
-        show_agent_reasoning(technical_analysis, "Technical Analyst")
-
-    # Add the signal to the analyst_signals list
-    state["data"]["analyst_signals"]["technical_analyst_agent"] = technical_analysis
-
+        try:
+            # 获取K线数据
+            klines = binance.get_klines(ticker, interval='1d', limit=100)
+            
+            # 转换为DataFrame
+            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+                                             'close_time', 'quote_volume', 'trades', 'taker_buy_volume',
+                                             'taker_buy_quote_volume', 'ignore'])
+            
+            # 转换数据类型
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+            
+            # 计算技术指标
+            df['SMA_20'] = calculate_sma(df['close'], 20)
+            df['SMA_50'] = calculate_sma(df['close'], 50)
+            df['RSI'] = calculate_rsi(df['close'])
+            df['MACD'], df['Signal'], df['Hist'] = calculate_macd(df['close'])
+            
+            # 分析信号
+            signal = "neutral"
+            confidence = 50.0
+            reasons = []
+            
+            # 分析均线
+            last_close = df['close'].iloc[-1]
+            sma_20 = df['SMA_20'].iloc[-1]
+            sma_50 = df['SMA_50'].iloc[-1]
+            
+            if last_close > sma_20 and last_close > sma_50:
+                signal = "bullish"
+                confidence += 15
+                reasons.append("价格位于双均线之上")
+            elif last_close < sma_20 and last_close < sma_50:
+                signal = "bearish"
+                confidence += 15
+                reasons.append("价格位于双均线之下")
+            
+            # 分析RSI
+            last_rsi = df['RSI'].iloc[-1]
+            if last_rsi > 70:
+                signal = "bearish"
+                confidence += 10
+                reasons.append(f"RSI超买 ({last_rsi:.1f})")
+            elif last_rsi < 30:
+                signal = "bullish"
+                confidence += 10
+                reasons.append(f"RSI超卖 ({last_rsi:.1f})")
+            
+            # 分析MACD
+            last_macd = df['MACD'].iloc[-1]
+            last_signal = df['Signal'].iloc[-1]
+            if last_macd > last_signal:
+                signal = "bullish"
+                confidence += 10
+                reasons.append("MACD金叉")
+            elif last_macd < last_signal:
+                signal = "bearish"
+                confidence += 10
+                reasons.append("MACD死叉")
+            
+            analysis_results[ticker] = {
+                "signal": signal,
+                "confidence": min(confidence, 100),
+                "reasoning": " | ".join(reasons),
+                "metrics": {
+                    "close": last_close,
+                    "sma_20": sma_20,
+                    "sma_50": sma_50,
+                    "rsi": last_rsi,
+                    "macd": last_macd,
+                    "macd_signal": last_signal
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"分析{ticker}时出错: {str(e)}")
+            analysis_results[ticker] = {
+                "signal": "neutral",
+                "confidence": 0,
+                "reasoning": f"分析出错: {str(e)}",
+                "metrics": {}
+            }
+    
     return {
-        "messages": state["messages"] + [message],
-        "data": data,
+        "data": {
+            **state["data"],
+            "analyst_signals": {
+                **state["data"].get("analyst_signals", {}),
+                "technical_analyst_agent": analysis_results
+            }
+        }
     }
+
+def calculate_sma(series: pd.Series, period: int) -> pd.Series:
+    """计算简单移动平均"""
+    return series.rolling(window=period).mean()
+
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """计算RSI"""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
+    """计算MACD"""
+    exp1 = series.ewm(span=fast, adjust=False).mean()
+    exp2 = series.ewm(span=slow, adjust=False).mean()
+    macd = exp1 - exp2
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    histogram = macd - signal_line
+    return macd, signal_line, histogram
 
 
 def calculate_trend_signals(prices_df):
@@ -393,17 +400,6 @@ def normalize_pandas(obj):
     elif isinstance(obj, (list, tuple)):
         return [normalize_pandas(item) for item in obj]
     return obj
-
-
-def calculate_rsi(prices_df: pd.DataFrame, period: int = 14) -> pd.Series:
-    delta = prices_df["close"].diff()
-    gain = (delta.where(delta > 0, 0)).fillna(0)
-    loss = (-delta.where(delta < 0, 0)).fillna(0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
 
 
 def calculate_bollinger_bands(prices_df: pd.DataFrame, window: int = 20) -> tuple[pd.Series, pd.Series]:

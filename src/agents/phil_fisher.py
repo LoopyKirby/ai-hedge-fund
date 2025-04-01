@@ -14,6 +14,10 @@ from typing_extensions import Literal
 from utils.progress import progress
 from utils.llm import call_llm
 import statistics
+from tools.binance_data import binance
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class PhilFisherSignal(BaseModel):
@@ -23,146 +27,75 @@ class PhilFisherSignal(BaseModel):
 
 
 def phil_fisher_agent(state: AgentState):
-    """
-    Analyzes stocks using Phil Fisher's investing principles:
-      - Seek companies with long-term above-average growth potential
-      - Emphasize quality of management and R&D
-      - Look for strong margins, consistent growth, and manageable leverage
-      - Combine fundamental 'scuttlebutt' style checks with basic sentiment and insider data
-      - Willing to pay up for quality, but still mindful of valuation
-      - Generally focuses on long-term compounding
-
-    Returns a bullish/bearish/neutral signal with confidence and reasoning.
-    """
+    """Phil Fisher 分析代理 - 加密货币版本"""
     data = state["data"]
-    start_date = data["start_date"]
-    end_date = data["end_date"]
     tickers = data["tickers"]
-
-    analysis_data = {}
-    fisher_analysis = {}
-
+    analysis_results = {}
+    
     for ticker in tickers:
-        progress.update_status("phil_fisher_agent", ticker, "Fetching financial metrics")
-        metrics = get_financial_metrics(ticker, end_date, period="annual", limit=5)
-
-        progress.update_status("phil_fisher_agent", ticker, "Gathering financial line items")
-        # Include relevant line items for Phil Fisher's approach:
-        #   - Growth & Quality: revenue, net_income, earnings_per_share, R&D expense
-        #   - Margins & Stability: operating_income, operating_margin, gross_margin
-        #   - Management Efficiency & Leverage: total_debt, shareholders_equity, free_cash_flow
-        #   - Valuation: net_income, free_cash_flow (for P/E, P/FCF), ebit, ebitda
-        financial_line_items = search_line_items(
-            ticker,
-            [
-                "revenue",
-                "net_income",
-                "earnings_per_share",
-                "free_cash_flow",
-                "research_and_development",
-                "operating_income",
-                "operating_margin",
-                "gross_margin",
-                "total_debt",
-                "shareholders_equity",
-                "cash_and_equivalents",
-                "ebit",
-                "ebitda",
-            ],
-            end_date,
-            period="annual",
-            limit=5,
-        )
-
-        progress.update_status("phil_fisher_agent", ticker, "Getting market cap")
-        market_cap = get_market_cap(ticker, end_date)
-
-        progress.update_status("phil_fisher_agent", ticker, "Fetching insider trades")
-        insider_trades = get_insider_trades(ticker, end_date, start_date=None, limit=50)
-
-        progress.update_status("phil_fisher_agent", ticker, "Fetching company news")
-        company_news = get_company_news(ticker, end_date, start_date=None, limit=50)
-
-        progress.update_status("phil_fisher_agent", ticker, "Analyzing growth & quality")
-        growth_quality = analyze_fisher_growth_quality(financial_line_items)
-
-        progress.update_status("phil_fisher_agent", ticker, "Analyzing margins & stability")
-        margins_stability = analyze_margins_stability(financial_line_items)
-
-        progress.update_status("phil_fisher_agent", ticker, "Analyzing management efficiency & leverage")
-        mgmt_efficiency = analyze_management_efficiency_leverage(financial_line_items)
-
-        progress.update_status("phil_fisher_agent", ticker, "Analyzing valuation (Fisher style)")
-        fisher_valuation = analyze_fisher_valuation(financial_line_items, market_cap)
-
-        progress.update_status("phil_fisher_agent", ticker, "Analyzing insider activity")
-        insider_activity = analyze_insider_activity(insider_trades)
-
-        progress.update_status("phil_fisher_agent", ticker, "Analyzing sentiment")
-        sentiment_analysis = analyze_sentiment(company_news)
-
-        # Combine partial scores with weights typical for Fisher:
-        #   30% Growth & Quality
-        #   25% Margins & Stability
-        #   20% Management Efficiency
-        #   15% Valuation
-        #   5% Insider Activity
-        #   5% Sentiment
-        total_score = (
-            growth_quality["score"] * 0.30
-            + margins_stability["score"] * 0.25
-            + mgmt_efficiency["score"] * 0.20
-            + fisher_valuation["score"] * 0.15
-            + insider_activity["score"] * 0.05
-            + sentiment_analysis["score"] * 0.05
-        )
-
-        max_possible_score = 10
-
-        # Simple bullish/neutral/bearish signal
-        if total_score >= 7.5:
-            signal = "bullish"
-        elif total_score <= 4.5:
-            signal = "bearish"
-        else:
+        try:
+            # 获取市场数据
+            ticker_24h = binance.get_ticker_24h(ticker)
+            klines = binance.get_klines(ticker, interval='1d', limit=60)
+            
+            # 分析数据
+            current_price = float(ticker_24h['lastPrice'])
+            volume = float(ticker_24h['volume'])
+            price_change = float(ticker_24h['priceChangePercent'])
+            
+            # 计算趋势
+            closing_prices = [float(k[4]) for k in klines]
+            volumes = [float(k[5]) for k in klines]
+            
+            # Fisher 风格分析（关注增长和质量）
             signal = "neutral"
-
-        analysis_data[ticker] = {
-            "signal": signal,
-            "score": total_score,
-            "max_score": max_possible_score,
-            "growth_quality": growth_quality,
-            "margins_stability": margins_stability,
-            "management_efficiency": mgmt_efficiency,
-            "valuation_analysis": fisher_valuation,
-            "insider_activity": insider_activity,
-            "sentiment_analysis": sentiment_analysis,
+            confidence = 50.0
+            reasons = []
+            
+            # 分析价格趋势
+            price_trend_60d = (closing_prices[-1] - closing_prices[0]) / closing_prices[0] * 100
+            if price_trend_60d > 40:
+                signal = "bullish"
+                confidence += 20
+                reasons.append(f"显著的增长趋势 ({price_trend_60d:.2f}%)")
+            
+            # 分析交易量趋势
+            volume_trend = (sum(volumes[-7:]) / 7) / (sum(volumes[-30:-7]) / 23)
+            if volume_trend > 1.5:
+                confidence += 15
+                reasons.append("交易量呈上升趋势")
+            
+            analysis_results[ticker] = {
+                "signal": signal,
+                "confidence": min(confidence, 100),
+                "reasoning": " | ".join(reasons),
+                "metrics": {
+                    "current_price": current_price,
+                    "volume_24h": volume,
+                    "price_change_24h": price_change,
+                    "price_trend_60d": price_trend_60d,
+                    "volume_trend": volume_trend
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"分析{ticker}时出错: {e}")
+            analysis_results[ticker] = {
+                "signal": "neutral",
+                "confidence": 0,
+                "reasoning": f"分析出错: {str(e)}",
+                "metrics": {}
+            }
+    
+    return {
+        "data": {
+            **state["data"],
+            "analyst_signals": {
+                **state["data"].get("analyst_signals", {}),
+                "phil_fisher_agent": analysis_results
+            }
         }
-
-        progress.update_status("phil_fisher_agent", ticker, "Generating Phil Fisher-style analysis")
-        fisher_output = generate_fisher_output(
-            ticker=ticker,
-            analysis_data=analysis_data,
-            model_name=state["metadata"]["model_name"],
-            model_provider=state["metadata"]["model_provider"],
-        )
-
-        fisher_analysis[ticker] = {
-            "signal": fisher_output.signal,
-            "confidence": fisher_output.confidence,
-            "reasoning": fisher_output.reasoning,
-        }
-
-        progress.update_status("phil_fisher_agent", ticker, "Done")
-
-    # Wrap results in a single message
-    message = HumanMessage(content=json.dumps(fisher_analysis), name="phil_fisher_agent")
-
-    if state["metadata"].get("show_reasoning"):
-        show_agent_reasoning(fisher_analysis, "Phil Fisher Agent")
-
-    state["data"]["analyst_signals"]["phil_fisher_agent"] = fisher_analysis
-    return {"messages": [message], "data": state["data"]}
+    }
 
 
 def analyze_fisher_growth_quality(financial_line_items: list) -> dict:

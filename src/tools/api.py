@@ -1,282 +1,271 @@
-import os
+from typing import List, Dict, Optional
+from datetime import datetime
 import pandas as pd
+from tools.binance_data import binance
+from data.models import Price, FinancialMetrics, FinancialMetricsResponse
+import os
 import requests
+import logging
 
-from data.cache import get_cache
-from data.models import (
-    CompanyNews,
-    CompanyNewsResponse,
-    FinancialMetrics,
-    FinancialMetricsResponse,
-    Price,
-    PriceResponse,
-    LineItem,
-    LineItemResponse,
-    InsiderTrade,
-    InsiderTradeResponse,
-)
+logger = logging.getLogger(__name__)
 
-# Global cache instance
-_cache = get_cache()
+def get_prices(ticker: str, start_date: str, end_date: str) -> List[Price]:
+    """获取价格历史数据"""
+    try:
+        if ticker.endswith('USDT'):
+            # 转换日期为时间戳
+            start_ts = int(datetime.strptime(start_date, '%Y-%m-%d').timestamp() * 1000)
+            end_ts = int(datetime.strptime(end_date, '%Y-%m-%d').timestamp() * 1000)
+            
+            # 获取K线数据
+            klines = binance.get_klines(
+                symbol=ticker,
+                interval='1d',
+                start_time=start_ts,
+                end_time=end_ts
+            )
+            
+            # 转换为Price对象
+            prices = []
+            for k in klines:
+                price = Price(
+                    time=datetime.fromtimestamp(k[0]/1000).strftime('%Y-%m-%d'),
+                    open=float(k[1]),
+                    high=float(k[2]),
+                    low=float(k[3]),
+                    close=float(k[4]),
+                    volume=float(k[5]),
+                    ticker=ticker
+                )
+                prices.append(price)
+            return prices
+            
+        return []
+        
+    except Exception as e:
+        logger.error(f"获取价格数据失败: {e}")
+        return []
 
-
-def get_prices(ticker: str, start_date: str, end_date: str) -> list[Price]:
-    """Fetch price data from cache or API."""
-    # Check cache first
-    if cached_data := _cache.get_prices(ticker):
-        # Filter cached data by date range and convert to Price objects
-        filtered_data = [Price(**price) for price in cached_data if start_date <= price["time"] <= end_date]
-        if filtered_data:
-            return filtered_data
-
-    # If not in cache or no data in range, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
-
-    url = f"https://api.financialdatasets.ai/prices/?ticker={ticker}&interval=day&interval_multiplier=1&start_date={start_date}&end_date={end_date}"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
-
-    # Parse response with Pydantic model
-    price_response = PriceResponse(**response.json())
-    prices = price_response.prices
-
+def prices_to_df(prices: List[Price]) -> pd.DataFrame:
+    """将价格列表转换为DataFrame"""
     if not prices:
-        return []
-
-    # Cache the results as dicts
-    _cache.set_prices(ticker, [p.model_dump() for p in prices])
-    return prices
-
-
-def get_financial_metrics(
-    ticker: str,
-    end_date: str,
-    period: str = "ttm",
-    limit: int = 10,
-) -> list[FinancialMetrics]:
-    """Fetch financial metrics from cache or API."""
-    # Check cache first
-    if cached_data := _cache.get_financial_metrics(ticker):
-        # Filter cached data by date and limit
-        filtered_data = [FinancialMetrics(**metric) for metric in cached_data if metric["report_period"] <= end_date]
-        filtered_data.sort(key=lambda x: x.report_period, reverse=True)
-        if filtered_data:
-            return filtered_data[:limit]
-
-    # If not in cache or insufficient data, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
-
-    url = f"https://api.financialdatasets.ai/financial-metrics/?ticker={ticker}&report_period_lte={end_date}&limit={limit}&period={period}"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
-
-    # Parse response with Pydantic model
-    metrics_response = FinancialMetricsResponse(**response.json())
-    # Return the FinancialMetrics objects directly instead of converting to dict
-    financial_metrics = metrics_response.financial_metrics
-
-    if not financial_metrics:
-        return []
-
-    # Cache the results as dicts
-    _cache.set_financial_metrics(ticker, [m.model_dump() for m in financial_metrics])
-    return financial_metrics
-
-
-def search_line_items(
-    ticker: str,
-    line_items: list[str],
-    end_date: str,
-    period: str = "ttm",
-    limit: int = 10,
-) -> list[LineItem]:
-    """Fetch line items from API."""
-    # If not in cache or insufficient data, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
-
-    url = "https://api.financialdatasets.ai/financials/search/line-items"
-
-    body = {
-        "tickers": [ticker],
-        "line_items": line_items,
-        "end_date": end_date,
-        "period": period,
-        "limit": limit,
-    }
-    response = requests.post(url, headers=headers, json=body)
-    if response.status_code != 200:
-        raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
-    data = response.json()
-    response_model = LineItemResponse(**data)
-    search_results = response_model.search_results
-    if not search_results:
-        return []
-
-    # Cache the results
-    return search_results[:limit]
-
-
-def get_insider_trades(
-    ticker: str,
-    end_date: str,
-    start_date: str | None = None,
-    limit: int = 1000,
-) -> list[InsiderTrade]:
-    """Fetch insider trades from cache or API."""
-    # Check cache first
-    if cached_data := _cache.get_insider_trades(ticker):
-        # Filter cached data by date range
-        filtered_data = [InsiderTrade(**trade) for trade in cached_data 
-                        if (start_date is None or (trade.get("transaction_date") or trade["filing_date"]) >= start_date)
-                        and (trade.get("transaction_date") or trade["filing_date"]) <= end_date]
-        filtered_data.sort(key=lambda x: x.transaction_date or x.filing_date, reverse=True)
-        if filtered_data:
-            return filtered_data
-
-    # If not in cache or insufficient data, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
-
-    all_trades = []
-    current_end_date = end_date
+        return pd.DataFrame()
+        
+    data = []
+    for p in prices:
+        data.append({
+            'time': p.time,
+            'open': p.open,
+            'high': p.high,
+            'low': p.low,
+            'close': p.close,
+            'volume': p.volume,
+            'ticker': p.ticker
+        })
     
-    while True:
-        url = f"https://api.financialdatasets.ai/insider-trades/?ticker={ticker}&filing_date_lte={current_end_date}"
-        if start_date:
-            url += f"&filing_date_gte={start_date}"
-        url += f"&limit={limit}"
-        
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
-        
-        data = response.json()
-        response_model = InsiderTradeResponse(**data)
-        insider_trades = response_model.insider_trades
-        
-        if not insider_trades:
-            break
-            
-        all_trades.extend(insider_trades)
-        
-        # Only continue pagination if we have a start_date and got a full page
-        if not start_date or len(insider_trades) < limit:
-            break
-            
-        # Update end_date to the oldest filing date from current batch for next iteration
-        current_end_date = min(trade.filing_date for trade in insider_trades).split('T')[0]
-        
-        # If we've reached or passed the start_date, we can stop
-        if current_end_date <= start_date:
-            break
-
-    if not all_trades:
-        return []
-
-    # Cache the results
-    _cache.set_insider_trades(ticker, [trade.model_dump() for trade in all_trades])
-    return all_trades
-
-
-def get_company_news(
-    ticker: str,
-    end_date: str,
-    start_date: str | None = None,
-    limit: int = 1000,
-) -> list[CompanyNews]:
-    """Fetch company news from cache or API."""
-    # Check cache first
-    if cached_data := _cache.get_company_news(ticker):
-        # Filter cached data by date range
-        filtered_data = [CompanyNews(**news) for news in cached_data 
-                        if (start_date is None or news["date"] >= start_date)
-                        and news["date"] <= end_date]
-        filtered_data.sort(key=lambda x: x.date, reverse=True)
-        if filtered_data:
-            return filtered_data
-
-    # If not in cache or insufficient data, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
-
-    all_news = []
-    current_end_date = end_date
-    
-    while True:
-        url = f"https://api.financialdatasets.ai/news/?ticker={ticker}&end_date={current_end_date}"
-        if start_date:
-            url += f"&start_date={start_date}"
-        url += f"&limit={limit}"
-        
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
-        
-        data = response.json()
-        response_model = CompanyNewsResponse(**data)
-        company_news = response_model.news
-        
-        if not company_news:
-            break
-            
-        all_news.extend(company_news)
-        
-        # Only continue pagination if we have a start_date and got a full page
-        if not start_date or len(company_news) < limit:
-            break
-            
-        # Update end_date to the oldest date from current batch for next iteration
-        current_end_date = min(news.date for news in company_news).split('T')[0]
-        
-        # If we've reached or passed the start_date, we can stop
-        if current_end_date <= start_date:
-            break
-
-    if not all_news:
-        return []
-
-    # Cache the results
-    _cache.set_company_news(ticker, [news.model_dump() for news in all_news])
-    return all_news
-
-
-
-def get_market_cap(
-    ticker: str,
-    end_date: str,
-) -> float | None:
-    """Fetch market cap from the API."""
-    financial_metrics = get_financial_metrics(ticker, end_date)
-    market_cap = financial_metrics[0].market_cap
-    if not market_cap:
-        return None
-
-    return market_cap
-
-
-def prices_to_df(prices: list[Price]) -> pd.DataFrame:
-    """Convert prices to a DataFrame."""
-    df = pd.DataFrame([p.model_dump() for p in prices])
-    df["Date"] = pd.to_datetime(df["time"])
-    df.set_index("Date", inplace=True)
-    numeric_cols = ["open", "close", "high", "low", "volume"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df.sort_index(inplace=True)
+    df = pd.DataFrame(data)
+    df['time'] = pd.to_datetime(df['time'])
+    df.set_index('time', inplace=True)
     return df
 
+def get_financial_metrics(ticker: str, end_date: str, period: str = "annual", limit: int = 5) -> List[FinancialMetrics]:
+    """获取财务指标，支持加密货币"""
+    try:
+        if ticker.endswith('USDT'):
+            ticker_24h = binance.get_ticker_24h(ticker)
+            klines = binance.get_klines(ticker, interval='1d', limit=30)
+            
+            metrics = FinancialMetrics(
+                ticker=ticker,
+                time=end_date,
+                revenue=float(ticker_24h['volume']),
+                gross_profit=float(ticker_24h['priceChangePercent']),
+                operating_income=float(ticker_24h['weightedAvgPrice']),
+                net_income=float(ticker_24h['lastPrice']),
+                eps=0.0,
+                shares_outstanding=float(ticker_24h['volume']),
+                free_cash_flow=float(ticker_24h['quoteVolume'])
+            )
+            return [metrics]
+            
+        # 如果是传统股票
+        headers = {}
+        if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+            headers["X-API-KEY"] = api_key
+        
+        url = f"https://api.financialdatasets.ai/financials/?ticker={ticker}&period={period}&limit={limit}"
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            return []
+            
+        metrics_response = FinancialMetricsResponse(**response.json())
+        return metrics_response.financials
+        
+    except Exception as e:
+        logger.error(f"获取财务数据失败: {e}")
+        return []
 
-# Update the get_price_data function to use the new functions
-def get_price_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    prices = get_prices(ticker, start_date, end_date)
-    return prices_to_df(prices)
+def get_market_cap(ticker: str) -> Optional[float]:
+    """获取市值，支持加密货币"""
+    try:
+        if ticker.endswith('USDT'):
+            ticker_24h = binance.get_ticker_24h(ticker)
+            # 对于加密货币，使用当前价格 * 24小时成交量作为市值估算
+            return float(ticker_24h['lastPrice']) * float(ticker_24h['volume'])
+        
+        # 如果是传统股票
+        headers = {}
+        if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+            headers["X-API-KEY"] = api_key
+            
+        url = f"https://api.financialdatasets.ai/market_cap/?ticker={ticker}"
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            return float(response.json()["market_cap"])
+        return None
+        
+    except Exception as e:
+        logger.error(f"获取市值失败: {e}")
+        return None
+
+def search_line_items(ticker: str) -> Dict:
+    """搜索财务项目，支持加密货币"""
+    try:
+        if ticker.endswith('USDT'):
+            ticker_24h = binance.get_ticker_24h(ticker)
+            return {
+                'price': float(ticker_24h['lastPrice']),
+                'volume': float(ticker_24h['volume']),
+                'price_change': float(ticker_24h['priceChangePercent']),
+                'weighted_avg_price': float(ticker_24h['weightedAvgPrice']),
+                'quote_volume': float(ticker_24h['quoteVolume'])
+            }
+            
+        # 如果是传统股票
+        headers = {}
+        if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+            headers["X-API-KEY"] = api_key
+            
+        url = f"https://api.financialdatasets.ai/line_items/?ticker={ticker}"
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            return response.json()
+        return {}
+        
+    except Exception as e:
+        logger.error(f"搜索财务项目失败: {e}")
+        return {}
+
+def get_insider_trades(ticker: str, limit: int = 100) -> List[Dict]:
+    """获取内部交易数据，支持加密货币"""
+    try:
+        if ticker.endswith('USDT'):
+            # 对于加密货币，使用大额交易作为"内部交易"的替代
+            trades = binance.get_trades(ticker, limit=limit)
+            large_trades = [
+                {
+                    'date': datetime.fromtimestamp(t['time']/1000).strftime('%Y-%m-%d'),
+                    'type': 'buy' if t['isBuyerMaker'] else 'sell',
+                    'amount': float(t['qty']),
+                    'price': float(t['price'])
+                }
+                for t in trades
+                if float(t['qty']) * float(t['price']) > 100000  # 只返回大于10万USDT的交易
+            ]
+            return large_trades
+            
+        # 如果是传统股票
+        headers = {}
+        if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+            headers["X-API-KEY"] = api_key
+            
+        url = f"https://api.financialdatasets.ai/insider_trades/?ticker={ticker}&limit={limit}"
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            return response.json()["trades"]
+        return []
+        
+    except Exception as e:
+        logger.error(f"获取内部交易数据失败: {e}")
+        return []
+
+def get_news_sentiment(ticker: str, days: int = 30) -> Dict:
+    """获取新闻情绪数据，支持加密货币"""
+    try:
+        if ticker.endswith('USDT'):
+            # 对于加密货币，使用价格变化和交易量作为市场情绪的替代指标
+            klines = binance.get_klines(ticker, interval='1d', limit=days)
+            
+            # 计算平均涨跌幅
+            price_changes = [
+                (float(k[4]) - float(k[1])) / float(k[1]) * 100 
+                for k in klines
+            ]
+            avg_change = sum(price_changes) / len(price_changes)
+            
+            # 计算成交量趋势
+            volumes = [float(k[5]) for k in klines]
+            volume_trend = (sum(volumes[-7:]) / 7) / (sum(volumes[-days:-7]) / (days-7))
+            
+            return {
+                'sentiment_score': avg_change / 10,  # 将涨跌幅转换为-1到1之间的情绪分数
+                'volume_trend': volume_trend,
+                'price_trend': avg_change,
+                'news_count': 0  # 加密货币没有传统新闻源数据
+            }
+            
+        # 如果是传统股票
+        headers = {}
+        if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+            headers["X-API-KEY"] = api_key
+            
+        url = f"https://api.financialdatasets.ai/news_sentiment/?ticker={ticker}&days={days}"
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            return response.json()
+        return {}
+        
+    except Exception as e:
+        logger.error(f"获取新闻情绪数据失败: {e}")
+        return {}
+    
+# ... 其他导入和函数保持不变 ...
+
+def get_company_news(ticker: str, days: int = 30) -> List[Dict]:
+    """获取公司新闻，支持加密货币"""
+    try:
+        if ticker.endswith('USDT'):
+            # 对于加密货币，使用最近的大额交易作为"新闻"
+            trades = binance.get_trades(ticker, limit=50)
+            news = [
+                {
+                    'date': datetime.fromtimestamp(t['time']/1000).strftime('%Y-%m-%d'),
+                    'title': f"Large {t['isBuyerMaker'] and 'Buy' or 'Sell'} Order",
+                    'summary': f"Trade amount: {float(t['qty']):.2f} at price {float(t['price']):.2f}",
+                    'sentiment': 'positive' if t['isBuyerMaker'] else 'negative'
+                }
+                for t in trades
+                if float(t['qty']) * float(t['price']) > 100000  # 只返回大于10万USDT的交易
+            ]
+            return news
+            
+        # 如果是传统股票
+        headers = {}
+        if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+            headers["X-API-KEY"] = api_key
+            
+        url = f"https://api.financialdatasets.ai/company_news/?ticker={ticker}&days={days}"
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            return response.json()["news"]
+        return []
+        
+    except Exception as e:
+        logger.error(f"获取公司新闻失败: {e}")
+        return []

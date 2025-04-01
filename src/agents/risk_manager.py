@@ -1,83 +1,71 @@
-from langchain_core.messages import HumanMessage
-from graph.state import AgentState, show_agent_reasoning
-from utils.progress import progress
-from tools.api import get_prices, prices_to_df
-import json
+from graph.state import AgentState
+from tools.binance_data import binance
+import logging
+from typing import Dict, Any
 
+logger = logging.getLogger(__name__)
 
-##### Risk Management Agent #####
-def risk_management_agent(state: AgentState):
-    """Controls position sizing based on real-world risk factors for multiple tickers."""
-    portfolio = state["data"]["portfolio"]
+def risk_management_agent(state: AgentState) -> Dict[str, Any]:
+    """风险管理代理"""
     data = state["data"]
     tickers = data["tickers"]
-
-    # Initialize risk analysis for each ticker
     risk_analysis = {}
-    current_prices = {}  # Store prices here to avoid redundant API calls
-
+    
     for ticker in tickers:
-        progress.update_status("risk_management_agent", ticker, "Analyzing price data")
-
-        prices = get_prices(
-            ticker=ticker,
-            start_date=data["start_date"],
-            end_date=data["end_date"],
-        )
-
-        if not prices:
-            progress.update_status("risk_management_agent", ticker, "Failed: No price data found")
-            continue
-
-        prices_df = prices_to_df(prices)
-
-        progress.update_status("risk_management_agent", ticker, "Calculating position limits")
-
-        # Calculate portfolio value
-        current_price = prices_df["close"].iloc[-1]
-        current_prices[ticker] = current_price  # Store the current price
-
-        # Calculate current position value for this ticker
-        current_position_value = portfolio.get("cost_basis", {}).get(ticker, 0)
-
-        # Calculate total portfolio value using stored prices
-        total_portfolio_value = portfolio.get("cash", 0) + sum(portfolio.get("cost_basis", {}).get(t, 0) for t in portfolio.get("cost_basis", {}))
-
-        # Base limit is 20% of portfolio for any single position
-        position_limit = total_portfolio_value * 0.20
-
-        # For existing positions, subtract current position value from limit
-        remaining_position_limit = position_limit - current_position_value
-
-        # Ensure we don't exceed available cash
-        max_position_size = min(remaining_position_limit, portfolio.get("cash", 0))
-
-        risk_analysis[ticker] = {
-            "remaining_position_limit": float(max_position_size),
-            "current_price": float(current_price),
-            "reasoning": {
-                "portfolio_value": float(total_portfolio_value),
-                "current_position": float(current_position_value),
-                "position_limit": float(position_limit),
-                "remaining_limit": float(remaining_position_limit),
-                "available_cash": float(portfolio.get("cash", 0)),
-            },
-        }
-
-        progress.update_status("risk_management_agent", ticker, "Done")
-
-    message = HumanMessage(
-        content=json.dumps(risk_analysis),
-        name="risk_management_agent",
-    )
-
-    if state["metadata"]["show_reasoning"]:
-        show_agent_reasoning(risk_analysis, "Risk Management Agent")
-
-    # Add the signal to the analyst_signals list
-    state["data"]["analyst_signals"]["risk_management_agent"] = risk_analysis
-
+        try:
+            ticker_24h = binance.get_ticker_24h(ticker)
+            
+            # 计算基本风险指标
+            price = float(ticker_24h['lastPrice'])
+            volume = float(ticker_24h['volume'])
+            price_change = float(ticker_24h['priceChangePercent'])
+            
+            # 风险评估
+            risk_level = "medium"
+            max_position = 1.0  # 默认允许100%仓位
+            
+            # 基于价格波动调整风险
+            if abs(price_change) > 10:
+                risk_level = "high"
+                max_position = 0.3  # 高风险时限制到30%
+            elif abs(price_change) < 3:
+                risk_level = "low"
+                max_position = 1.0  # 低风险时允许满仓
+            
+            # 基于成交量调整
+            avg_volume = float(ticker_24h['quoteVolume']) / price
+            if volume > avg_volume * 2:
+                risk_level = "high"
+                max_position *= 0.8  # 成交量异常时降低20%仓位
+            
+            risk_analysis[ticker] = {
+                "risk_level": risk_level,
+                "max_position": max_position,
+                "current_price": price,  # 添加当前价格
+                "remaining_position_limit": max_position * 100000,  # 假设总资金100000
+                "metrics": {
+                    "price": price,
+                    "volume_24h": volume,
+                    "price_change_24h": price_change
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"分析{ticker}时出错: {str(e)}")
+            risk_analysis[ticker] = {
+                "risk_level": "high",
+                "max_position": 0,
+                "current_price": 0,
+                "remaining_position_limit": 0,
+                "metrics": {}
+            }
+    
     return {
-        "messages": state["messages"] + [message],
-        "data": data,
+        "data": {
+            **state["data"],
+            "analyst_signals": {
+                **state["data"].get("analyst_signals", {}),
+                "risk_management_agent": risk_analysis
+            }
+        }
     }

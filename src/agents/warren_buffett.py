@@ -7,6 +7,10 @@ from typing_extensions import Literal
 from tools.api import get_financial_metrics, get_market_cap, search_line_items
 from utils.llm import call_llm
 from utils.progress import progress
+from tools.binance_data import binance
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class WarrenBuffettSignal(BaseModel):
@@ -16,123 +20,85 @@ class WarrenBuffettSignal(BaseModel):
 
 
 def warren_buffett_agent(state: AgentState):
-    """Analyzes stocks using Buffett's principles and LLM reasoning."""
+    """Warren Buffett 分析代理 - 适配加密货币版本"""
     data = state["data"]
-    end_date = data["end_date"]
     tickers = data["tickers"]
-
-    # Collect all analysis for LLM reasoning
-    analysis_data = {}
-    buffett_analysis = {}
-
+    analysis_results = {}
+    
     for ticker in tickers:
-        progress.update_status("warren_buffett_agent", ticker, "Fetching financial metrics")
-        # Fetch required data
-        metrics = get_financial_metrics(ticker, end_date, period="ttm", limit=5)
-
-        progress.update_status("warren_buffett_agent", ticker, "Gathering financial line items")
-        financial_line_items = search_line_items(
-            ticker,
-            [
-                "capital_expenditure",
-                "depreciation_and_amortization",
-                "net_income",
-                "outstanding_shares",
-                "total_assets",
-                "total_liabilities",
-                "dividends_and_other_cash_distributions",
-                "issuance_or_purchase_of_equity_shares",
-            ],
-            end_date,
-        )
-
-        progress.update_status("warren_buffett_agent", ticker, "Getting market cap")
-        # Get current market cap
-        market_cap = get_market_cap(ticker, end_date)
-
-        progress.update_status("warren_buffett_agent", ticker, "Analyzing fundamentals")
-        # Analyze fundamentals
-        fundamental_analysis = analyze_fundamentals(metrics)
-
-        progress.update_status("warren_buffett_agent", ticker, "Analyzing consistency")
-        consistency_analysis = analyze_consistency(financial_line_items)
-
-        progress.update_status("warren_buffett_agent", ticker, "Analyzing moat")
-        moat_analysis = analyze_moat(metrics)
-
-        progress.update_status("warren_buffett_agent", ticker, "Analyzing management quality")
-        mgmt_analysis = analyze_management_quality(financial_line_items)
-
-        progress.update_status("warren_buffett_agent", ticker, "Calculating intrinsic value")
-        intrinsic_value_analysis = calculate_intrinsic_value(financial_line_items)
-
-        # Calculate total score
-        total_score = fundamental_analysis["score"] + consistency_analysis["score"] + moat_analysis["score"] + mgmt_analysis["score"]
-        max_possible_score = 10 + moat_analysis["max_score"] + mgmt_analysis["max_score"]
-        # fundamental_analysis + consistency combined were up to 10 points total
-        # moat can add up to 3, mgmt can add up to 2, for example
-
-        # Add margin of safety analysis if we have both intrinsic value and current price
-        margin_of_safety = None
-        intrinsic_value = intrinsic_value_analysis["intrinsic_value"]
-        if intrinsic_value and market_cap:
-            margin_of_safety = (intrinsic_value - market_cap) / market_cap
-
-        # Generate trading signal using a stricter margin-of-safety requirement
-        # if fundamentals+moat+management are strong but margin_of_safety < 0.3, it's neutral
-        # if fundamentals are very weak or margin_of_safety is severely negative -> bearish
-        # else bullish
-        if (total_score >= 0.7 * max_possible_score) and margin_of_safety and (margin_of_safety >= 0.3):
-            signal = "bullish"
-        elif total_score <= 0.3 * max_possible_score or (margin_of_safety is not None and margin_of_safety < -0.3):
-            # negative margin of safety beyond -30% could be overpriced -> bearish
-            signal = "bearish"
-        else:
+        try:
+            # 获取24小时市场数据
+            ticker_data = binance.get_ticker_24h(ticker)
+            
+            # 获取最近的K线数据用于计算趋势
+            klines = binance.get_klines(ticker, interval='1d', limit=30)
+            
+            # 分析数据
+            price_change = float(ticker_data['priceChangePercent'])
+            volume = float(ticker_data['volume'])
+            weighted_price = float(ticker_data['weightedAvgPrice'])
+            
+            # 计算30天价格趋势
+            closing_prices = [float(k[4]) for k in klines]
+            price_trend = (closing_prices[-1] - closing_prices[0]) / closing_prices[0] * 100
+            
+            # 巴菲特风格的分析
             signal = "neutral"
-
-        # Combine all analysis results
-        analysis_data[ticker] = {
-            "signal": signal,
-            "score": total_score,
-            "max_score": max_possible_score,
-            "fundamental_analysis": fundamental_analysis,
-            "consistency_analysis": consistency_analysis,
-            "moat_analysis": moat_analysis,
-            "management_analysis": mgmt_analysis,
-            "intrinsic_value_analysis": intrinsic_value_analysis,
-            "market_cap": market_cap,
-            "margin_of_safety": margin_of_safety,
+            confidence = 50.0
+            reasons = []
+            
+            # 分析价格趋势
+            if price_trend > 20:  # 强劲上涨趋势
+                signal = "bullish"
+                confidence += 15
+                reasons.append(f"强劲的上涨趋势 ({price_trend:.2f}%)")
+            elif price_trend < -20:  # 强劲下跌趋势
+                signal = "bearish"
+                confidence += 15
+                reasons.append(f"明显的下跌趋势 ({price_trend:.2f}%)")
+            
+            # 分析交易量
+            avg_volume = sum(float(k[5]) for k in klines) / len(klines)
+            if volume > avg_volume * 1.5:
+                confidence += 10
+                reasons.append("交易量显著高于平均水平")
+            
+            # 分析价格变化
+            if abs(price_change) > 10:
+                confidence += 10
+                reasons.append(f"24小时价格变化显著 ({price_change:.2f}%)")
+            
+            # 生成分析结果
+            analysis_results[ticker] = {
+                "signal": signal,
+                "confidence": min(confidence, 100),
+                "reasoning": " | ".join(reasons),
+                "metrics": {
+                    "price_change_24h": price_change,
+                    "volume_24h": volume,
+                    "weighted_avg_price": weighted_price,
+                    "price_trend_30d": price_trend
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"分析{ticker}时出错: {e}")
+            analysis_results[ticker] = {
+                "signal": "neutral",
+                "confidence": 0,
+                "reasoning": f"分析出错: {str(e)}",
+                "metrics": {}
+            }
+    
+    return {
+        "data": {
+            **state["data"],
+            "analyst_signals": {
+                **state["data"].get("analyst_signals", {}),
+                "warren_buffett_agent": analysis_results
+            }
         }
-
-        progress.update_status("warren_buffett_agent", ticker, "Generating Warren Buffett analysis")
-        buffett_output = generate_buffett_output(
-            ticker=ticker,
-            analysis_data=analysis_data,
-            model_name=state["metadata"]["model_name"],
-            model_provider=state["metadata"]["model_provider"],
-        )
-
-        # Store analysis in consistent format with other agents
-        buffett_analysis[ticker] = {
-            "signal": buffett_output.signal,
-            "confidence": buffett_output.confidence, # Normalize between 0 to 100
-            "reasoning": buffett_output.reasoning,
-        }
-
-        progress.update_status("warren_buffett_agent", ticker, "Done")
-
-    # Create the message
-    message = HumanMessage(content=json.dumps(buffett_analysis), name="warren_buffett_agent")
-
-    # Show reasoning if requested
-    if state["metadata"]["show_reasoning"]:
-        show_agent_reasoning(buffett_analysis, "Warren Buffett Agent")
-
-    # Add the signal to the analyst_signals list
-    state["data"]["analyst_signals"]["warren_buffett_agent"] = buffett_analysis
-
-    return {"messages": [message], "data": state["data"]}
-
+    }
 
 def analyze_fundamentals(metrics: list) -> dict[str, any]:
     """Analyze company fundamentals based on Buffett's criteria."""
@@ -447,3 +413,4 @@ def generate_buffett_output(
         agent_name="warren_buffett_agent",
         default_factory=create_default_warren_buffett_signal,
     )
+

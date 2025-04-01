@@ -1,4 +1,5 @@
 import json
+import logging
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -7,7 +8,10 @@ from pydantic import BaseModel, Field
 from typing_extensions import Literal
 from utils.progress import progress
 from utils.llm import call_llm
+from tools.binance_data import binance
 
+# 创建 logger
+logger = logging.getLogger(__name__)
 
 class PortfolioDecision(BaseModel):
     action: Literal["buy", "sell", "short", "cover", "hold"]
@@ -23,8 +27,6 @@ class PortfolioManagerOutput(BaseModel):
 ##### Portfolio Management Agent #####
 def portfolio_management_agent(state: AgentState):
     """Makes final trading decisions and generates orders for multiple tickers"""
-
-    # Get the portfolio and analyst signals
     portfolio = state["data"]["portfolio"]
     analyst_signals = state["data"]["analyst_signals"]
     tickers = state["data"]["tickers"]
@@ -36,30 +38,119 @@ def portfolio_management_agent(state: AgentState):
     current_prices = {}
     max_shares = {}
     signals_by_ticker = {}
+    
     for ticker in tickers:
         progress.update_status("portfolio_management_agent", ticker, "Processing analyst signals")
 
-        # Get position limits and current prices for the ticker
-        risk_data = analyst_signals.get("risk_management_agent", {}).get(ticker, {})
-        position_limits[ticker] = risk_data.get("remaining_position_limit", 0)
-        current_prices[ticker] = risk_data.get("current_price", 0)
+        try:
+            # 直接从Binance获取当前价格
+            ticker_data = binance.get_ticker_24h(ticker)
+            current_price = float(ticker_data['lastPrice'])
+            
+            # 获取风险管理数据
+            risk_data = analyst_signals.get("risk_management_agent", {}).get(ticker, {})
+            position_limits[ticker] = risk_data.get("remaining_position_limit", 0)
+            current_prices[ticker] = current_price  # 使用直接获取的价格
+            
+            # 计算最大可交易数量
+            if current_price > 0:
+                max_shares[ticker] = min(
+                    int(position_limits[ticker] / current_price),
+                    int(portfolio.get("cash", 0) / current_price)
+                )
+            else:
+                max_shares[ticker] = 0
+                logger.error(f"{ticker} 价格获取失败")
 
-        # Calculate maximum shares allowed based on position limit and price
-        if current_prices[ticker] > 0:
-            max_shares[ticker] = int(position_limits[ticker] / current_prices[ticker])
-        else:
+            # 收集分析师信号
+            ticker_signals = {}
+            for agent, signals in analyst_signals.items():
+                if agent != "risk_management_agent" and ticker in signals:
+                    signal_data = signals[ticker]
+                    if isinstance(signal_data, dict) and "signal" in signal_data and "confidence" in signal_data:
+                        ticker_signals[agent] = {
+                            "signal": signal_data["signal"],
+                            "confidence": float(signal_data["confidence"]),
+                            "reasoning": signal_data.get("reasoning", "")
+                        }
+            signals_by_ticker[ticker] = ticker_signals
+            
+            # 调试日志
+            logger.debug(f"{ticker} 分析结果:")
+            logger.debug(f"价格: {current_price}")
+            logger.debug(f"最大可交易数量: {max_shares[ticker]}")
+            logger.debug(f"分析师信号: {json.dumps(ticker_signals, indent=2)}")
+            
+        except Exception as e:
+            logger.error(f"处理 {ticker} 时出错: {str(e)}")
+            current_prices[ticker] = 0
             max_shares[ticker] = 0
-
-        # Get signals for the ticker
-        ticker_signals = {}
-        for agent, signals in analyst_signals.items():
-            if agent != "risk_management_agent" and ticker in signals:
-                ticker_signals[agent] = {"signal": signals[ticker]["signal"], "confidence": signals[ticker]["confidence"]}
-        signals_by_ticker[ticker] = ticker_signals
+            signals_by_ticker[ticker] = {}
 
     progress.update_status("portfolio_management_agent", None, "Making trading decisions")
 
-    # Generate the trading decision
+    # 生成交易决策
+    template = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """你是一个加密货币投资组合经理。请基于多个分析师的意见，为每个交易对做出最终决策。
+
+            交易规则:
+            1. 多头仓位:
+               - 只有在有可用现金时才能买入
+               - 只有在持有多头时才能卖出
+               - 卖出数量 ≤ 当前持仓量
+               - 买入数量 ≤ max_shares值
+
+            2. 空头仓位:
+               - 需要50%保证金
+               - 只有在有空头时才能回补
+               - 回补数量 ≤ 当前空头量
+               - 做空数量需符合保证金要求
+
+            决策要求:
+            1. 综合所有分析师意见
+            2. 计算看多/看空/中性信号的数量和权重
+            3. 考虑每个分析师的置信度
+            4. 详细解释决策理由
+            5. 遵守风险管理限制
+
+            必须严格按照以下JSON格式输出:
+            {
+              "decisions": {
+                "TICKER": {
+                  "action": "buy/sell/short/cover/hold",
+                  "quantity": 整数,
+                  "confidence": 0-100的浮点数,
+                  "reasoning": "详细的决策理由"
+                }
+              }
+            }
+            """
+        ),
+        (
+            "human",
+            """请分析以下数据并做出交易决策:
+
+            分析师信号:
+            {signals_by_ticker}
+
+            当前价格:
+            {current_prices}
+
+            最大可交易数量:
+            {max_shares}
+
+            可用现金: {portfolio_cash} USDT
+            当前持仓: {portfolio_positions}
+            保证金要求: {margin_requirement} USDT
+
+            请直接返回符合要求的JSON格式决策。
+            """
+        )
+    ])
+
+    # 生成决策
     result = generate_trading_decision(
         tickers=tickers,
         signals_by_ticker=signals_by_ticker,
@@ -70,13 +161,13 @@ def portfolio_management_agent(state: AgentState):
         model_provider=state["metadata"]["model_provider"],
     )
 
-    # Create the portfolio management message
+    # 创建投资组合管理消息
     message = HumanMessage(
         content=json.dumps({ticker: decision.model_dump() for ticker, decision in result.decisions.items()}),
         name="portfolio_management",
     )
 
-    # Print the decision if the flag is set
+    # 如果需要，显示决策理由
     if state["metadata"]["show_reasoning"]:
         show_agent_reasoning({ticker: decision.model_dump() for ticker, decision in result.decisions.items()}, "Portfolio Management Agent")
 
